@@ -162,6 +162,22 @@ async def remove_from_channel(interaction: discord.Interaction, subs: str):
     else:
         await interaction.response.send_message(f'Removed {successes} subreddit(s) from this channel!', ephemeral=True)
 
+# Show from channel command
+@client.tree.command(name='show_channel_subs', description='Shows every sub connected to this channel')
+async def show_channel_subs(interaction: discord.Interaction):
+    channel = interaction.channel
+
+    subs = session.query(Subreddit).filter(Subreddit.channel_id == channel.id)
+    sub_list_str = ''
+
+    for sub in subs:
+        sub_list_str += f'- {sub.name}\n'
+    
+    if sub_list_str:
+        await interaction.response.send_message(f'Subreddits connected to {channel.name}: \n\n{sub_list_str}', ephemeral=True)
+    else:
+        await interaction.response.send_message(f'No subreddits are connected to {channel.name}', ephemeral=True)
+
 # Runs Discord Bot
 if __name__ == '__main__':
     client.run(DISCORD_TOKEN)
