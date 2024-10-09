@@ -6,6 +6,7 @@ This bot gets posts from subreddits and automatically sends them on Discord
 
 import discord
 import praw
+from prawcore import NotFound, Redirect
 from sqlalchemy import create_engine, Column, String, Integer, and_, exists
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -91,18 +92,32 @@ async def sub_to_channel(interaction: discord.Interaction, subs: str):
     subs_list = subs.split()
     channel = interaction.channel
     guild = interaction.guild
+    successes = 0
+    exceptions = []
 
     for sub in subs_list:
+        # Checks if already exists on database
         sub_query = session.query(exists().where(and_(Subreddit.name == sub, Subreddit.channel_id == channel.id))).scalar()
 
         if sub_query:
+            continue
+        
+        # Checks if subreddit exists or is banned
+        try:
+            reddit_instance.subreddits.search_by_name(sub, exact=True)
+        except(NotFound, Redirect):
+            exceptions.append(sub)
             continue
 
         sub_set = Subreddit(guild.id, channel.id, sub)
         session.add(sub_set)
         session.commit()
-    
-    await interaction.response.send_message(f'{len(subs_list)} subreddit(s) set to this channel!')
+        successes += 1
+
+    if exceptions:
+        await interaction.response.send_message(f'Set {successes} new subreddit(s) to this channel!\nExceptions: {exceptions}', ephemeral=True)
+    else:
+        await interaction.response.send_message(f'Set {successes} new subreddit(s) to this channel!', ephemeral=True)
 
 # Runs Discord Bot
 if __name__ == '__main__':
