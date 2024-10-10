@@ -5,13 +5,12 @@ This bot gets posts from subreddits and automatically sends them on Discord
 '''
 
 import discord
-import praw
+import asyncpraw as praw
 import asyncio
-from prawcore import NotFound, Redirect
+from asyncprawcore import NotFound, Redirect
 from sqlalchemy import create_engine, Column, String, Integer, ForeignKey, and_, select
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from pathlib import Path
 from discord.ext import commands, tasks
 from dotenv import dotenv_values
 
@@ -49,9 +48,6 @@ async def create_engine():
 engine = asyncio.run(create_engine())
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
-# Paths
-FILE_PATH = Path(__file__).absolute().parent
-
 # Reddit app values
 config = dotenv_values('.env')
 
@@ -60,9 +56,6 @@ REDDIT_PASSWORD = config['REDDIT_PASSWORD']
 REDDIT_CLIENT_ID = config['REDDIT_CLIENT_ID']
 REDDIT_CLIENT_SECRET = config['REDDIT_CLIENT_SECRET']
 REDDIT_USER_AGENT = config['REDDIT_USER_AGENT']
-
-reddit_instance = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, password=REDDIT_PASSWORD, 
-                              user_agent=REDDIT_USER_AGENT, username=REDDIT_USERNAME, check_for_async=False)
 
 # Discord bot values
 DISCORD_TOKEN = config['DISCORD_TOKEN']
@@ -83,6 +76,10 @@ async def on_ready():
 # Newest post loop
 @tasks.loop(seconds=10)
 async def sub_update():
+    # Reddit instance
+    reddit_instance = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, password=REDDIT_PASSWORD, 
+                              user_agent=REDDIT_USER_AGENT, username=REDDIT_USERNAME, check_for_async=False)
+    
     async with async_session() as session:
         # Subreddits that the bot will monitor
         sub_list = []
@@ -94,25 +91,26 @@ async def sub_update():
 
         subreddits = {}
         submissions = {}
-
+        
         # Creates the subs dict
         for sub in sub_list:
             # Checks if subreddit exists or is banned
             try:
-                reddit_instance.subreddits.search_by_name(sub, exact=True)
-            except(NotFound, Redirect):
+                test_subreddit = await reddit_instance.subreddit(sub, fetch=True)
+            except(NotFound, Redirect): 
                 continue
-            subreddits[sub] = reddit_instance.subreddit(sub)
+            subreddits[sub] = await reddit_instance.subreddit(sub)
 
         # Sends newest posts
         for sub in subreddits:
             # Checks if subreddit exists or is banned
             try:
-                reddit_instance.subreddits.search_by_name(sub, exact=True)
-            except(NotFound, Redirect):
+                test_subreddit = await reddit_instance.subreddit(sub, fetch=True)
+            except(NotFound, Redirect): 
                 continue
 
-            submissions[sub] = next(subreddits[sub].new(limit=1))
+            async for submission in subreddits[sub].new(limit=1):
+                submissions[sub] = submission
             content = submissions[sub]
 
             # Checks if sub is in latest_submissions
@@ -133,11 +131,17 @@ async def sub_update():
                 channel_to_send = client.get_channel(int(channel))
                 await channel_to_send.send(content.title)
                 latest_submissions[sub] = content.id
+                
+    await reddit_instance.close()
 
 # Set channel command
 @client.tree.command(name='set_sub_to_channel', 
                      description='Sets subreddit posts to be sent to this channel, multiple subreddits can be set separating by space.')
 async def sub_to_channel(interaction: discord.Interaction, subs: str):
+    # Reddit instance
+    reddit_instance = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, password=REDDIT_PASSWORD, 
+                              user_agent=REDDIT_USER_AGENT, username=REDDIT_USERNAME, check_for_async=False)
+    
     async with async_session() as session:
         await interaction.response.defer()
 
@@ -153,7 +157,7 @@ async def sub_to_channel(interaction: discord.Interaction, subs: str):
 
             # Checks if subreddit exists or is banned
             try:
-                reddit_instance.subreddits.search_by_name(sub, exact=True)
+                test_subreddit = await reddit_instance.subreddit(sub, fetch=True)
                 # Adds subreddit to database if not there
                 if not sub_query:
                     new_sub = Subreddit(sub)
@@ -177,6 +181,8 @@ async def sub_to_channel(interaction: discord.Interaction, subs: str):
             await session.commit()
             successes += 1
 
+        await reddit_instance.close()
+        
         if exceptions:
             await interaction.followup.send(f'Set {successes} new subreddit(s) to this channel!\nExceptions: {exceptions}', ephemeral=True)
         else:
@@ -210,7 +216,7 @@ async def remove_from_channel(interaction: discord.Interaction, subs: str):
                     successes += 1
             else:
                 exceptions.append(sub)
-
+        
         if exceptions:
             await interaction.followup.send(f'Removed {successes} subreddit(s) from this channel!\nExceptions: {exceptions}', ephemeral=True)
         else:
