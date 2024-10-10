@@ -129,7 +129,13 @@ async def sub_update():
             # Sends content to channels
             for channel in sub_channel_list:
                 channel_to_send = client.get_channel(int(channel))
-                await channel_to_send.send(content.title)
+
+                # Checks if has image or video
+                if str(content.url).startswith('https://i.redd.it') or str(content.url).startswith('https://v.redd.it'):
+                    await channel_to_send.send(f'**{content.title}**\nBy: *{content.author.name}*\n{content.selftext}\n{content.url}')
+                else:
+                    await channel_to_send.send(f'**{content.title}**\nBy: *{content.author.name}*\n{content.selftext}')
+                    
                 latest_submissions[sub] = content.id
                 
     await reddit_instance.close()
@@ -182,7 +188,7 @@ async def sub_to_channel(interaction: discord.Interaction, subs: str):
             successes += 1
 
         await reddit_instance.close()
-        
+
         if exceptions:
             await interaction.followup.send(f'Set {successes} new subreddit(s) to this channel!\nExceptions: {exceptions}', ephemeral=True)
         else:
