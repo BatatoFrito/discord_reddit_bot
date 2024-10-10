@@ -6,10 +6,11 @@ This bot gets posts from subreddits and automatically sends them on Discord
 
 import discord
 import praw
+import asyncio
 from prawcore import NotFound, Redirect
-from sqlalchemy import create_engine, Column, String, Integer, and_, exists
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, Column, String, Integer, ForeignKey, and_, select
+from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from pathlib import Path
 from discord.ext import commands, tasks
 from dotenv import dotenv_values
@@ -21,19 +22,32 @@ class Subreddit(Base):
     __tablename__ = 'subreddits'
 
     _id = Column('id', Integer, primary_key=True)
-    guild_id = Column('guild_id', Integer)
-    channel_id = Column('channel_id', Integer)
     name = Column('name', String)
+    channels = relationship('Channel', backref='subreddit', lazy="selectin")
 
-    def __init__(self, guild_id, channel_id, name):
-        self.guild_id = guild_id
-        self.channel_id = channel_id
+    def __init__(self, name):
         self.name = name
 
-engine = create_engine('sqlite:///subreddits.db')
-Base.metadata.create_all(bind=engine)
-Session = sessionmaker(bind=engine)
-session = Session()
+class Channel(Base):
+    __tablename__ = 'channels'
+
+    _id = Column('id', Integer, primary_key=True)
+    sid = Column('sid', Integer, ForeignKey('subreddits.id'))
+    channel_id = Column('channel_id', String)
+
+    def __init__(self, channel_id, sid):
+        self.channel_id = channel_id
+        self.sid = sid
+
+# Creates engine and sessionmaker
+async def create_engine():
+    engine = create_async_engine('sqlite+aiosqlite:///subreddits.db')
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    return engine
+
+engine = asyncio.run(create_engine())
+async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 # Paths
 FILE_PATH = Path(__file__).absolute().parent
@@ -53,11 +67,12 @@ reddit_instance = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_C
 # Discord bot values
 DISCORD_TOKEN = config['DISCORD_TOKEN']
 intents = discord.Intents.default()
+intents.message_content = True
 
 client = commands.Bot(command_prefix='!', intents=intents)
 
-# Latest submissions list
-latest_submissions = []
+# Recent submissions list
+latest_submissions = {}
 
 @client.event
 async def on_ready():
@@ -68,115 +83,160 @@ async def on_ready():
 # Newest post loop
 @tasks.loop(seconds=10)
 async def sub_update():
-    # Subreddits that the bot will monitor
-    sub_list = []
-    sub_db = session.query(Subreddit).all()
+    async with async_session() as session:
+        # Subreddits that the bot will monitor
+        sub_list = []
+        sub_db = await session.execute(select(Subreddit))
+        sub_db = sub_db.scalars().all()
 
-    for sub in sub_db:
-        # Checks if subreddit exists or is banned
-        try:
-            reddit_instance.subreddits.search_by_name(sub.name, exact=True)
-        except(NotFound, Redirect):
-            continue
-        sub_list.append(sub)
+        for sub in sub_db:
+            sub_list.append(sub.name)
 
-    subreddits = {}
-    submissions = {}
+        subreddits = {}
+        submissions = {}
 
-    # Creates the subs dict
-    for sub in sub_list:
-        if sub.name in subreddits:
-            continue
-        else:
-            subreddits[f'{sub.name}'] = reddit_instance.subreddit(f'{sub.name}')
+        # Creates the subs dict
+        for sub in sub_list:
+            # Checks if subreddit exists or is banned
+            try:
+                reddit_instance.subreddits.search_by_name(sub, exact=True)
+            except(NotFound, Redirect):
+                continue
+            subreddits[sub] = reddit_instance.subreddit(sub)
 
-    # Sends newest posts
-    for sub in sub_list:
-        channel = client.get_channel(sub.channel_id)
-        submissions[f'{sub.name}'] = next(subreddits[f'{sub.name}'].new(limit=1))
-        content = submissions[f'{sub.name}']
-        content_check = (content.id, channel.id)
+        # Sends newest posts
+        for sub in subreddits:
+            # Checks if subreddit exists or is banned
+            try:
+                reddit_instance.subreddits.search_by_name(sub, exact=True)
+            except(NotFound, Redirect):
+                continue
 
-        # Checks if has already been sent
-        if content_check in latest_submissions:
-            continue
+            submissions[sub] = next(subreddits[sub].new(limit=1))
+            content = submissions[sub]
 
-        await channel.send(content.title)
-        latest_submissions.append(content_check)
+            # Checks if sub is in latest_submissions
+            if not sub in latest_submissions:
+                latest_submissions[sub] = 0
+            
+            # Checks if already sent
+            if content.id == latest_submissions[sub]:
+                continue
+            
+            # Gets channels linked to sub
+            sub_set = await session.execute(select(Subreddit).where(Subreddit.name == sub))
+            sub_set = sub_set.scalars().first()
+            sub_channel_list = [sub_channel.channel_id for sub_channel in sub_set.channels]
+
+            # Sends content to channels
+            for channel in sub_channel_list:
+                channel_to_send = client.get_channel(int(channel))
+                await channel_to_send.send(content.title)
+                latest_submissions[sub] = content.id
 
 # Set channel command
 @client.tree.command(name='set_sub_to_channel', 
                      description='Sets subreddit posts to be sent to this channel, multiple subreddits can be set separating by space.')
 async def sub_to_channel(interaction: discord.Interaction, subs: str):
-    subs_list = subs.split()
-    channel = interaction.channel
-    guild = interaction.guild
-    successes = 0
-    exceptions = []
+    async with async_session() as session:
+        await interaction.response.defer()
 
-    for sub in subs_list:
-        # Checks if already exists on database
-        sub_query = session.query(exists().where(and_(Subreddit.name == sub, Subreddit.channel_id == channel.id))).scalar()
+        subs_list = subs.split()
+        channel = interaction.channel
+        successes = 0
+        exceptions = []
 
-        if sub_query:
-            continue
-        
-        # Checks if subreddit exists or is banned
-        try:
-            reddit_instance.subreddits.search_by_name(sub, exact=True)
-        except(NotFound, Redirect):
-            exceptions.append(sub)
-            continue
+        for sub in subs_list:
+            # Checks if subreddit already exists on database
+            sub_query = await session.execute(select(Subreddit).where(Subreddit.name == sub))
+            sub_query = sub_query.scalar()
 
-        sub_set = Subreddit(guild.id, channel.id, sub)
-        session.add(sub_set)
-        session.commit()
-        successes += 1
+            # Checks if subreddit exists or is banned
+            try:
+                reddit_instance.subreddits.search_by_name(sub, exact=True)
+                # Adds subreddit to database if not there
+                if not sub_query:
+                    new_sub = Subreddit(sub)
+                    session.add(new_sub)
+                    await session.commit()
+            except(NotFound, Redirect):
+                exceptions.append(sub)
+                continue
 
-    if exceptions:
-        await interaction.response.send_message(f'Set {successes} new subreddit(s) to this channel!\nExceptions: {exceptions}', ephemeral=True)
-    else:
-        await interaction.response.send_message(f'Set {successes} new subreddit(s) to this channel!', ephemeral=True)
+            # Checks if sub is already set to channel
+            sub_set = await session.execute(select(Subreddit).where(Subreddit.name == sub))
+            sub_set = sub_set.scalar()
+            sub_channel_list = [sub_channel.channel_id for sub_channel in sub_set.channels]
+
+            if str(channel.id) in sub_channel_list:
+                continue
+
+            # Sets sub to channel
+            sub_to_channel = Channel(channel.id, sub_set._id)
+            session.add(sub_to_channel)
+            await session.commit()
+            successes += 1
+
+        if exceptions:
+            await interaction.followup.send(f'Set {successes} new subreddit(s) to this channel!\nExceptions: {exceptions}', ephemeral=True)
+        else:
+            await interaction.followup.send(f'Set {successes} new subreddit(s) to this channel!', ephemeral=True)
 
 # Remove from channel command
 @client.tree.command(name='remove_sub_from_channel', 
                      description='Removes subs that were set in a channel, multiple subreddits can be removed separating by space.')
 async def remove_from_channel(interaction: discord.Interaction, subs: str):
-    subs_list = subs.split()
-    channel = interaction.channel
-    successes = 0
-    exceptions = []
+    async with async_session() as session:
+        await interaction.response.defer()
 
-    for sub in subs_list:
-        sub_query = session.query(Subreddit).filter(and_(Subreddit.name == sub, Subreddit.channel_id == channel.id)).first()
+        subs_list = subs.split()
+        channel = interaction.channel
+        successes = 0
+        exceptions = []
 
-        if sub_query:
-            session.delete(sub_query)
-            session.commit()
-            successes += 1
+        for sub in subs_list:
+            # Checks if sub in database
+            sub_query = await session.execute(select(Subreddit).where(Subreddit.name == sub))
+            sub_query = sub_query.scalar()
+
+            if sub_query:
+                # Checks if channel in database
+                channel_query = await session.execute(select(Channel).where(and_(Channel.channel_id == channel.id, Channel.sid == sub_query._id)))
+                channel_query = channel_query.scalar()
+
+                if channel_query:
+                    await session.delete(channel_query)
+                    await session.commit()
+                    successes += 1
+            else:
+                exceptions.append(sub)
+
+        if exceptions:
+            await interaction.followup.send(f'Removed {successes} subreddit(s) from this channel!\nExceptions: {exceptions}', ephemeral=True)
         else:
-            exceptions.append(sub)
-
-    if exceptions:
-        await interaction.response.send_message(f'Removed {successes} subreddit(s) from this channel!\nExceptions: {exceptions}', ephemeral=True)
-    else:
-        await interaction.response.send_message(f'Removed {successes} subreddit(s) from this channel!', ephemeral=True)
+            await interaction.followup.send(f'Removed {successes} subreddit(s) from this channel!', ephemeral=True)
 
 # Show from channel command
 @client.tree.command(name='show_channel_subs', description='Shows every sub connected to this channel')
 async def show_channel_subs(interaction: discord.Interaction):
-    channel = interaction.channel
+    async with async_session() as session:
+        await interaction.response.defer()
+        
+        channel = interaction.channel
 
-    subs = session.query(Subreddit).filter(Subreddit.channel_id == channel.id)
-    sub_list_str = ''
+        subs_in_channel = await session.execute(select(Channel).where(Channel.channel_id == channel.id))
+        subs_in_channel = subs_in_channel.scalars()
+        sub_list_str = ''
 
-    for sub in subs:
-        sub_list_str += f'- {sub.name}\n'
-    
-    if sub_list_str:
-        await interaction.response.send_message(f'Subreddits connected to {channel.name}: \n\n{sub_list_str}', ephemeral=True)
-    else:
-        await interaction.response.send_message(f'No subreddits are connected to {channel.name}', ephemeral=True)
+        for channel_in_list in subs_in_channel:
+            sub = await session.execute(select(Subreddit).where(Subreddit._id == channel_in_list.sid))
+            sub = sub.scalar()
+            sub_list_str += f'- {sub.name}\n'
+        
+        if sub_list_str:
+            await interaction.followup.send(f'Subreddits connected to {channel.name}: \n\n{sub_list_str}', ephemeral=True)
+        else:
+            await interaction.followup.send(f'No subreddits are connected to {channel.name}', ephemeral=True)
 
 # Runs Discord Bot
 if __name__ == '__main__':
